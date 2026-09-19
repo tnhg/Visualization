@@ -1,0 +1,16 @@
+# Optional override when automatic stage discovery is not semantically correct.
+stem: stem
+stages:
+  - stages.0
+  - stages.1
+  - stages.2
+  - stages.3
+representative_blocks:
+  - stages.0.blocks.0
+  - stages.2.blocks.6
+  - stages.3.blocks.1
+layouts:
+  stages.0: NCHW
+  stages.1: NCHW
+  stages.2: NCHW
+  stages.3: NCHW
