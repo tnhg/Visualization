@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -82,14 +82,16 @@ def homogeneous_proxy(image: torch.Tensor, output_size: Tuple[int, int], quantil
 
 
 def subset_similarity(feature: torch.Tensor, mask: torch.Tensor) -> float:
+    """Mean off-diagonal cosine similarity without constructing an N x N matrix."""
     tokens = token_matrix(feature)[0]
     selected = tokens[mask.flatten()]
     if selected.shape[0] < 2:
         return float("nan")
     selected = F.normalize(selected, dim=1, eps=EPS)
-    matrix = selected @ selected.T
-    values = matrix[~torch.eye(matrix.shape[0], dtype=torch.bool, device=matrix.device)]
-    return values.mean().item()
+    count = selected.shape[0]
+    diagonal = (selected * selected).sum()
+    total = selected.sum(dim=0).dot(selected.sum(dim=0)) - diagonal
+    return (total / (count * (count - 1))).item()
 
 
 def channel_similarity(feature: torch.Tensor, method: str = "cosine") -> torch.Tensor:
@@ -125,18 +127,32 @@ def scale_preferences(response: torch.Tensor, scales: torch.Tensor) -> tuple[tor
     return preference, selectivity
 
 
-def erf_radii(energy: torch.Tensor, fractions=(.5, .8, .9)) -> Dict[str, float]:
+def erf_radii(
+    energy: torch.Tensor, fractions=(.5, .8, .9), center: tuple[float, float] | None = None,
+) -> Dict[str, Any]:
     energy = energy.float().clamp_min(0)
     h, w = energy.shape[-2:]
     yy, xx = torch.meshgrid(
         torch.arange(h, device=energy.device), torch.arange(w, device=energy.device), indexing="ij")
-    cy, cx = (h - 1) / 2., (w - 1) / 2.
+    cy, cx = center if center is not None else ((h - 1) / 2., (w - 1) / 2.)
     distance = torch.sqrt((yy - cy).square() + (xx - cx).square()).flatten()
     values = energy.flatten()
+    if values.numel() == 0 or not torch.isfinite(values).all() or float(values.sum()) <= EPS:
+        return {
+            "status": "unavailable",
+            "reason": "no_signal_or_nonfinite_energy",
+            "radius_center_definition": "query" if center is not None else "image_center",
+            **{f"r{int(round(100 * fraction))}_pixels": None for fraction in fractions},
+            **{f"r{int(round(100 * fraction))}_normalized": None for fraction in fractions},
+        }
     order = torch.argsort(distance)
     cumulative = torch.cumsum(values[order], 0) / (values.sum() + EPS)
     sorted_distance = distance[order]
-    result: Dict[str, float] = {}
+    result: Dict[str, Any] = {
+        "status": "ok", "reason": "",
+        "radius_center_y": float(cy), "radius_center_x": float(cx),
+        "radius_center_definition": "query" if center is not None else "image_center",
+    }
     normalizer = float(max(h, w))
     for fraction in fractions:
         index = min(int(torch.searchsorted(cumulative, torch.tensor(fraction, device=energy.device))), len(order) - 1)

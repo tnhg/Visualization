@@ -98,8 +98,15 @@ def figure_b(scale_result: Optional[ScaleAnalysisResult], erf_rows: Sequence[dic
         import csv
         with sensitivity_path.open() as handle:
             sensitivity = list(csv.DictReader(handle))
-        values = [float(r.get("misclassification_correction_rate", r["top1"])) for r in sensitivity]
-        axes[1, 1].plot([float(r["scale"]) for r in sensitivity], values, marker="o")
+        valid = []
+        for row in sensitivity:
+            raw = row.get("misclassification_correction_rate") or row.get("top1")
+            try:
+                valid.append((float(row["scale"]), float(raw)))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if valid:
+            axes[1, 1].plot([item[0] for item in valid], [item[1] for item in valid], marker="o")
     axes[1, 1].set_title("Content-scale intervention")
     axes[1, 1].set_xlabel("content scale")
     axes[1, 1].set_ylabel("Original-error correction (%)")
@@ -142,6 +149,7 @@ def figure_c(
         import csv
         with joint_rows_path.open() as handle:
             joint = list(csv.DictReader(handle))
+    joint = [row for row in joint if _finite_pair(row, "within_scale_group_similarity", "between_scale_group_similarity")]
     if joint:
         names = [f"S{i+1}" for i in range(len(joint))]
         x = np.arange(len(names))
@@ -165,3 +173,10 @@ def figure_c(
     for ax in axes.flat:
         ax.grid(alpha=.2)
     save_figure(fig, output_dir / "paper_figures" / "figure_C_channel_specialization_redundancy_diagnostic")
+
+
+def _finite_pair(row: dict, left: str, right: str) -> bool:
+    try:
+        return np.isfinite(float(row[left])) and np.isfinite(float(row[right]))
+    except (KeyError, TypeError, ValueError):
+        return False

@@ -8,20 +8,29 @@ from typing import Any, Optional, Tuple
 import torch
 
 
-def first_tensor(value: Any) -> Optional[torch.Tensor]:
+def tensor_candidates(value: Any) -> list[torch.Tensor]:
     if isinstance(value, torch.Tensor):
-        return value
+        return [value]
     if isinstance(value, (list, tuple)):
+        result: list[torch.Tensor] = []
         for item in value:
-            tensor = first_tensor(item)
-            if tensor is not None:
-                return tensor
+            result.extend(tensor_candidates(item))
+        return result
     if isinstance(value, dict):
+        result: list[torch.Tensor] = []
         for item in value.values():
-            tensor = first_tensor(item)
-            if tensor is not None:
-                return tensor
-    return None
+            result.extend(tensor_candidates(item))
+        return result
+    return []
+
+
+def first_tensor(value: Any, strict: bool = False) -> Optional[torch.Tensor]:
+    candidates = tensor_candidates(value)
+    if strict and len(candidates) > 1:
+        raise ValueError(
+            f"ambiguous nested output contains {len(candidates)} tensors; "
+            "declare an adapter selector instead of choosing the first")
+    return candidates[0] if candidates else None
 
 
 def replace_first_tensor(value: Any, tensor: torch.Tensor) -> Any:
@@ -73,7 +82,7 @@ class FeatureTensorAdapter:
         layout_hint: Optional[str] = None,
         warn: bool = True,
     ) -> AdaptedFeature:
-        tensor = first_tensor(value)
+        tensor = first_tensor(value, strict=True)
         if tensor is None:
             raise TypeError("feature output does not contain a tensor")
         if tensor.ndim == 4:

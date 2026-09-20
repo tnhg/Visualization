@@ -18,14 +18,22 @@ from tools.rs_feature_diagnostics.checkpoint import load_checkpoint
 from tools.rs_feature_diagnostics.classification_analysis import analyze_classification
 from tools.rs_feature_diagnostics.config import parse_config
 from tools.rs_feature_diagnostics.dataset import load_segmentation_mask
+from tools.rs_feature_diagnostics.dataset import UnifiedPreprocessor
 from tools.rs_feature_diagnostics.erf import class_sensitive_gradient, stage_erf
 from tools.rs_feature_diagnostics.gradcam import GradCAM
 from tools.rs_feature_diagnostics.hook_manager import InterventionHook
-from tools.rs_feature_diagnostics.intervention import channel_mask_function, spatial_mask_function
-from tools.rs_feature_diagnostics.metrics import effective_rank, token_similarity
+from tools.rs_feature_diagnostics.head_diagnostics import exact_head_contribution
+from tools.rs_feature_diagnostics.intervention import (
+    channel_mask_function, channel_random_mask_function, greedy_clusters,
+    spatial_mask_function, spatial_random_mask_function,
+)
+from tools.rs_feature_diagnostics.metrics import effective_rank, subset_similarity, token_similarity
 from tools.rs_feature_diagnostics.model_inspector import ModelInspector
+from tools.rs_feature_diagnostics.reporting import compare_prediction_runs
 from tools.rs_feature_diagnostics.sample_selector import Prediction
 from tools.rs_feature_diagnostics.tensor_adapter import FeatureTensorAdapter
+from tools.rs_feature_diagnostics.tensor_adapter import first_tensor
+from tools.rs_feature_diagnostics.utils import artifact_path, stable_sample_id, write_csv, write_json
 
 
 class TinyCNN(nn.Module):
@@ -68,6 +76,14 @@ class CheckpointTests(unittest.TestCase):
             report = load_checkpoint(TinyCNN(3), path, 3, allow_head_mismatch=True)
             self.assertTrue(report.skipped_head_keys)
 
+    def test_ema_request_does_not_silently_fallback(self):
+        source = TinyCNN(3)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.pth"
+            torch.save({"state_dict": source.state_dict()}, path)
+            with self.assertRaisesRegex(KeyError, "EMA"):
+                load_checkpoint(TinyCNN(3), path, 3, use_ema=True)
+
 
 class TensorAndMetricTests(unittest.TestCase):
     def test_segmentation_mask_relative_lookup(self):
@@ -96,6 +112,10 @@ class TensorAndMetricTests(unittest.TestCase):
         self.assertEqual(adapted.tensor.shape, (2, 8, 7, 7))
         self.assertTrue(adapted.removed_class_token)
 
+    def test_ambiguous_nested_tensor_output_is_not_silently_selected(self):
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            first_tensor((torch.zeros(1, 2), torch.ones(1, 2)), strict=True)
+
     def test_effective_rank_and_similarity(self):
         feature = torch.randn(1, 12, 8, 8)
         rank = effective_rank(feature)
@@ -104,6 +124,81 @@ class TensorAndMetricTests(unittest.TestCase):
         self.assertEqual(matrix.shape, (20, 20))
         self.assertEqual(stats["sampled_tokens"], 20)
         self.assertEqual(indices.numel(), 20)
+
+    def test_unified_preprocessor_and_mask_replay_for_non_square_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = Image.new("RGB", (12, 8), "black")
+            pixels = image.load()
+            for x in range(12):
+                pixels[x, 4] = (255, 0, 0)
+            image_path = root / "sample.png"
+            image.save(image_path)
+            mask = Image.new("L", (12, 8), 0)
+            for y in range(2, 7):
+                for x in range(4, 9):
+                    mask.putpixel((x, y), 255)
+            mask_path = root / "mask.png"
+            mask.save(mask_path)
+            pre = UnifiedPreprocessor((3, 4, 6), (0.5,) * 3, (0.5,) * 3, .75, "nearest")
+            processed = pre.process_path(image_path)
+            self.assertEqual(tuple(processed.tensor.shape), (3, 4, 6))
+            self.assertEqual(processed.canvas.size, (6, 4))
+            self.assertEqual(processed.geometry.resized_size[0], 5)
+            self.assertGreaterEqual(processed.geometry.resized_size[1], 6)
+            replay = pre.mask_tensor(mask, processed.geometry, (2, 3))
+            self.assertEqual(tuple(replay.shape), (2, 3))
+            self.assertTrue(replay.any())
+
+    def test_csv_union_json_sanitization_and_artifact_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv_path = root / "mixed.csv"
+            write_csv(csv_path, [{"a": 1}, {"a": 2, "b": 3}])
+            self.assertIn("b", csv_path.read_text(encoding="utf-8").splitlines()[0])
+            empty = root / "empty.csv"
+            write_csv(empty, [], schema=["status", "reason"])
+            self.assertEqual(empty.read_text(encoding="utf-8").splitlines()[0], "status,reason")
+            json_path = root / "values.json"
+            write_json(json_path, {"nan": float("nan"), "inf": float("inf")})
+            self.assertNotIn("NaN", json_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifact_path(root / "blocks.5_energy", ".png").name, "blocks.5_energy.png")
+
+    def test_exact_spatial_keep_and_terminating_clusters(self):
+        output = torch.ones(1, 4, 2, 2)
+        response_mask = spatial_mask_function(.5, "zero")
+        modified = response_mask(output)
+        self.assertEqual(int((modified != 0).all(dim=1).sum()), 2)
+        self.assertEqual(response_mask.last_total_positions, 4)
+        self.assertEqual(greedy_clusters(torch.zeros(4, 4), .9), [[0], [1], [2], [3]])
+        self.assertAlmostEqual(subset_similarity(torch.zeros(1, 2, 1, 3), torch.ones(1, 3, dtype=torch.bool)), 0.0)
+        self.assertTrue(stable_sample_id("class/sample.jpg").startswith("s_"))
+        random_spatial = spatial_random_mask_function(.5, "zero", seed=4)(output)
+        self.assertEqual(int((random_spatial != 0).all(dim=1).sum()), 2)
+        random_channel = channel_random_mask_function(4, .5, "zero", seed=4)(output)
+        self.assertEqual(int((random_channel != 0).all(dim=(0, 2, 3)).sum()), 2)
+
+    def test_exact_signed_gap_linear_head_decomposition(self):
+        feature = torch.randn(1, 4, 3, 5)
+        classifier = nn.Linear(4, 3)
+        result = exact_head_contribution(feature, classifier, 1, 0)
+        self.assertEqual(result.status, "ok")
+        self.assertLessEqual(result.reconstruction_error, 1e-5)
+        self.assertEqual(tuple(result.contribution.shape), (1, 3, 5))
+
+    def test_compare_requires_stable_population_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rows = [
+                {"sample_id": "s_a", "relative_path": "a/0.png", "true_index": 0,
+                 "pred_index": 1, "confidence": .6},
+                {"sample_id": "s_b", "relative_path": "b/0.png", "true_index": 1,
+                 "pred_index": 1, "confidence": .8},
+            ]
+            for name, values in (("baseline", rows), ("candidate", [dict(rows[0], pred_index=0), rows[1]])):
+                write_csv(root / name / "predictions" / "predictions.csv", values)
+            summary = compare_prediction_runs(root / "baseline", root / "candidate", root / "out")
+            self.assertEqual(summary["corrected"], 1)
 
 
 class ClassificationAnalysisTests(unittest.TestCase):

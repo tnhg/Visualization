@@ -22,7 +22,7 @@ import torch
 from .dataset import open_rgb
 from .sample_selector import Prediction
 from .tensor_adapter import first_tensor
-from .utils import safe_name, write_csv
+from .utils import artifact_path, safe_name, write_csv
 from .visualization import heatmap, multi_panel, normalize_map, overlay
 
 
@@ -200,10 +200,17 @@ def analyze_attention_rollout_samples(
     device: torch.device,
     output_dir: Path,
     input_size: tuple[int, int, int],
+    mean: tuple[float, ...] = (0.485, 0.456, 0.406),
+    std: tuple[float, ...] = (0.229, 0.224, 0.225),
+    crop_pct: float = 1.0,
+    interpolation: str = "bilinear",
+    crop_mode: str = "center",
 ) -> list[dict]:
     """Create rollout and final-head figures for selected samples when supported."""
     rows: list[dict] = []
     prefix_tokens = model_prefix_tokens(model)
+    from .dataset import UnifiedPreprocessor
+    preprocessor = UnifiedPreprocessor(input_size, mean, std, crop_pct, interpolation, crop_mode)
     model.eval()
     with AttentionCapture(model) as capture:
         if not capture.candidate_names:
@@ -217,7 +224,8 @@ def analyze_attention_rollout_samples(
         else:
             for sample_no, prediction in enumerate(predictions):
                 sample_id = _sample_id(sample_no, prediction)
-                image, _ = dataset[prediction.dataset_index]
+                processed = preprocessor.process_path(prediction.image_path)
+                image = processed.tensor
                 expected_patch_grid = model_patch_grid(model, tuple(image.shape[-2:]))
                 captured = capture.capture(image.unsqueeze(0).to(device))
                 try:
@@ -233,13 +241,13 @@ def analyze_attention_rollout_samples(
                 base = output_dir / "attention" / f"{sample_id}_rollout"
                 base.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(
-                    base.with_suffix(".npz"), rollout=result.rollout,
+                    artifact_path(base, ".npz"), rollout=result.rollout,
                     final_head_maps=result.final_head_maps,
                     layer_names=np.asarray(result.layer_names),
                 )
                 title = f"Attention rollout ({len(result.layer_names)} layers)"
                 heatmap(result.rollout, base.with_name(base.name + "_map"), title, "class-token attention")
-                overlay(open_rgb(prediction.image_path), result.rollout,
+                overlay(processed.canvas, result.rollout,
                         base.with_name(base.name + "_overlay"), title)
                 visible_heads = min(16, result.final_head_maps.shape[0])
                 if visible_heads:
@@ -265,7 +273,7 @@ def analyze_attention_rollout_samples(
 
 
 def _sample_id(sample_no: int, prediction: Prediction) -> str:
-    return f"{sample_no:04d}_{safe_name(prediction.true_class)}_to_{safe_name(prediction.pred_class)}"
+    return prediction.sample_id or f"{sample_no:04d}_{safe_name(prediction.true_class)}_to_{safe_name(prediction.pred_class)}"
 
 
 def model_prefix_tokens(model) -> int:

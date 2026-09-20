@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torchvision.transforms import functional as TF
 
-from .dataset import base_canvas, load_segmentation_mask, open_rgb
+from .dataset import UnifiedPreprocessor, load_segmentation_mask, open_rgb
 from .hook_manager import CaptureHookManager
 from .metrics import (
     effective_rank, homogeneous_proxy, spatial_maps, subset_similarity,
@@ -16,7 +16,7 @@ from .metrics import (
 )
 from .sample_selector import Prediction
 from .tensor_adapter import FeatureTensorAdapter
-from .utils import safe_name, semantic_stage_label, write_csv, write_json
+from .utils import artifact_path, safe_name, semantic_stage_label, write_csv, write_json
 from .visualization import heatmap, histogram, multi_panel, overlay
 
 
@@ -38,21 +38,27 @@ def analyze_spatial(
     segmentation_mask_dir: Optional[Path] = None,
     split_root: Optional[Path] = None,
     layouts: Optional[Dict[str, str]] = None,
+    crop_mode: str = "center",
+    mean: Sequence[float] = (0.485, 0.456, 0.406),
+    std: Sequence[float] = (0.229, 0.224, 0.225),
 ) -> list[dict]:
     layouts = layouts or {}
     adapter = FeatureTensorAdapter()
+    preprocessor = UnifiedPreprocessor(
+        input_size, mean, std,
+        crop_pct, interpolation, crop_mode)
     rows: list[dict] = []
     model.eval()
     for sample_no, prediction in enumerate(predictions):
-        image_tensor, _ = dataset[prediction.dataset_index]
-        batch = image_tensor.unsqueeze(0).to(device)
+        processed = preprocessor.process_path(prediction.image_path)
+        batch = processed.tensor.unsqueeze(0).to(device)
         with CaptureHookManager(model, stage_names, detach=True) as hooks:
             with torch.inference_mode():
                 model(batch)
         original = open_rgb(prediction.image_path)
-        canvas = base_canvas(original, input_size[-2:], crop_pct, interpolation)
+        canvas = processed.canvas
         raw_tensor = TF.to_tensor(canvas).to(device)
-        sample_id = f"{sample_no:04d}_{safe_name(prediction.true_class)}_to_{safe_name(prediction.pred_class)}"
+        sample_id = prediction.sample_id
         sample_arrays = [np.asarray(canvas)]
         sample_titles = [
             f"Input image\nTrue: {prediction.true_class} | Pred: {prediction.pred_class}"
@@ -76,7 +82,8 @@ def analyze_spatial(
             segmentation_path = None
             if segmentation_mask_dir is not None and split_root is not None:
                 segmentation_mask, segmentation_path = load_segmentation_mask(
-                    segmentation_mask_dir, prediction.image_path, split_root, adapted.grid_size)
+                    segmentation_mask_dir, prediction.image_path, split_root, adapted.grid_size,
+                    preprocessor=preprocessor)
             if sample_no < similarity_samples:
                 similarity_matrix, similarity, sampled_indices = token_similarity(
                     feature, max_tokens, seed + sample_no)
@@ -126,7 +133,7 @@ def analyze_spatial(
             stage_dir.mkdir(parents=True, exist_ok=True)
             base = stage_dir / stage_label
             np.savez_compressed(
-                base.with_suffix(".npz"), energy=energy, variance=variance, entropy=entropy,
+                artifact_path(base, ".npz"), energy=energy, variance=variance, entropy=entropy,
                 similarity=similarity_matrix.cpu().numpy(), sampled_token_indices=sampled_indices.cpu().numpy(),
                 homogeneous_mask=homogeneous.cpu().numpy(),
                 segmentation_mask=(segmentation_mask.cpu().numpy() if segmentation_mask is not None

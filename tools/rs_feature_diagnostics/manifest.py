@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import inspect
+import subprocess
 from typing import Any, Dict, Optional
 
 import torch
@@ -9,7 +11,7 @@ from .checkpoint import CheckpointReport, classifier_shapes
 from .config import DiagnosticConfig
 from .dataset import DatasetInfo
 from .model_inspector import InspectionResult
-from .utils import environment_manifest, sha256_file, write_json
+from .utils import environment_manifest, git_commit, sha256_file, write_json
 
 
 def build_manifest(
@@ -58,6 +60,28 @@ def build_manifest(
             for name in hook_names
         },
         "missing_semantic_ops": [key for key, value in inspection.semantic_ops.items() if value == "not_available"],
+        "geometry_version": "unified_preprocessor_v1",
+        "model_class": f"{type(model).__module__}.{type(model).__qualname__}",
+        "model_class_source": inspect.getsourcefile(type(model)),
+        "model_source": {
+            "python_paths": [str(path) for path in cfg.python_paths],
+            "registration_modules": list(cfg.registration_modules),
+            "git_commits": {
+                str(path): git_commit(Path(path)) for path in cfg.python_paths if Path(path).is_dir()
+            },
+        },
+        "tool_repo_dirty": _git_dirty(repo_root),
+        "model_kwargs": cfg.model_kwargs,
+        "numeric_mode": {"amp": cfg.amp, "dtype": "float16_autocast" if cfg.amp else "float32"},
     })
     write_json(output_dir / "manifest" / "run_manifest.json", manifest)
     return manifest
+
+
+def _git_dirty(repo: Path) -> bool | None:
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=repo, stderr=subprocess.DEVNULL, text=True)
+        return bool(output.strip())
+    except (OSError, subprocess.CalledProcessError):
+        return None

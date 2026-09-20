@@ -21,6 +21,7 @@ class CheckpointReport:
     missing_keys: list[str] = field(default_factory=list)
     unexpected_keys: list[str] = field(default_factory=list)
     skipped_head_keys: list[str] = field(default_factory=list)
+    unsafe_pickle_used: bool = False
 
 
 def classifier_module_names(model: nn.Module) -> list[str]:
@@ -40,23 +41,31 @@ def classifier_shapes(model: nn.Module) -> Dict[str, Tuple[int, ...]]:
     }
 
 
-def _load_raw(path: Path) -> Any:
+def _load_raw(path: Path, trust_checkpoint: bool = False) -> tuple[Any, bool]:
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
+        return torch.load(path, map_location="cpu", weights_only=True), False
     except Exception as error:
-        LOG.warning("weights_only checkpoint load failed (%s); falling back to legacy pickle load", error)
-        return torch.load(path, map_location="cpu", weights_only=False)
+        if not trust_checkpoint:
+            raise RuntimeError(
+                "safe weights_only checkpoint loading failed. Refusing legacy pickle; "
+                "pass trust_checkpoint=True only for a trusted local checkpoint. "
+                f"Original error: {error}") from error
+        LOG.warning("using explicitly trusted legacy pickle checkpoint after weights_only failure: %s", error)
+        return torch.load(path, map_location="cpu", weights_only=False), True
 
 
 def _select_state_dict(payload: Any, use_ema: bool) -> tuple[Mapping[str, torch.Tensor], str]:
     if not isinstance(payload, Mapping):
         raise TypeError("checkpoint must be a mapping or state_dict")
-    priority = ("state_dict_ema", "model_ema", "state_dict", "model", "model_state_dict") if use_ema else (
-        "state_dict", "model", "model_state_dict", "state_dict_ema", "model_ema")
+    ema_keys = ("state_dict_ema", "model_ema")
+    normal_keys = ("state_dict", "model", "model_state_dict")
+    priority = ema_keys if use_ema else normal_keys
     for key in priority:
         candidate = payload.get(key)
         if isinstance(candidate, Mapping) and candidate and all(isinstance(v, torch.Tensor) for v in candidate.values()):
             return candidate, key
+    if use_ema:
+        raise KeyError("EMA weights were requested but no state_dict_ema/model_ema mapping exists")
     if payload and all(isinstance(v, torch.Tensor) for v in payload.values()):
         return payload, "root"
     raise KeyError(f"no model weights found; supported keys: {STATE_KEYS}")
@@ -72,6 +81,8 @@ def _strip_prefixes(state: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor
                 if key.startswith(prefix):
                     key = key[len(prefix):]
                     changed = True
+        if key in cleaned:
+            raise RuntimeError(f"checkpoint key collision after prefix stripping: {key!r}")
         cleaned[key] = value
     return cleaned
 
@@ -82,8 +93,9 @@ def load_checkpoint(
     num_classes: int,
     allow_head_mismatch: bool = False,
     use_ema: bool = False,
+    trust_checkpoint: bool = False,
 ) -> CheckpointReport:
-    payload = _load_raw(path)
+    payload, unsafe_pickle_used = _load_raw(path, trust_checkpoint=trust_checkpoint)
     selected, selected_key = _select_state_dict(payload, use_ema)
     state = _strip_prefixes(selected)
     target = model.state_dict()
@@ -130,5 +142,5 @@ def load_checkpoint(
         path=str(path), selected_key=selected_key,
         missing_keys=list(incompatible.missing_keys),
         unexpected_keys=list(incompatible.unexpected_keys),
-        skipped_head_keys=skipped,
+        skipped_head_keys=skipped, unsafe_pickle_used=unsafe_pickle_used,
     )

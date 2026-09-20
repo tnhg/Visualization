@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
+import numpy as np
 from PIL import Image
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
@@ -26,6 +27,132 @@ class DatasetInfo:
     @property
     def num_classes(self) -> int:
         return len(self.classes)
+
+
+@dataclass(frozen=True)
+class PreprocessGeometry:
+    """The exact geometry used to turn an original image into model input."""
+
+    original_size: tuple[int, int]
+    resized_size: tuple[int, int]
+    canvas_size: tuple[int, int]
+    crop_box: tuple[int, int, int, int]
+    crop_pct: float
+    crop_mode: str
+    interpolation: str
+    normalization: dict[str, tuple[float, ...]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PreprocessedSample:
+    tensor: torch.Tensor
+    canvas: Image.Image
+    geometry: PreprocessGeometry
+
+
+class UnifiedPreprocessor:
+    """Single source of truth for evaluation inputs, canvases, and masks."""
+
+    def __init__(
+        self,
+        input_size: tuple[int, int, int],
+        mean: Sequence[float],
+        std: Sequence[float],
+        crop_pct: float,
+        interpolation: str,
+        crop_mode: str = "center",
+    ) -> None:
+        if len(input_size) != 3 or input_size[0] != 3:
+            raise ValueError(f"input_size must be (3,H,W), got {input_size}")
+        if not 0 < float(crop_pct) <= 1:
+            raise ValueError("crop_pct must be in (0, 1]")
+        if len(mean) != 3 or len(std) != 3:
+            raise ValueError("mean and std must each contain three values")
+        if any(float(value) <= 0 for value in std):
+            raise ValueError("std values must be positive")
+        if crop_mode not in {"center", "resize"}:
+            raise ValueError(f"unsupported evaluation crop_mode: {crop_mode!r}")
+        self.input_size = tuple(int(value) for value in input_size)
+        self.mean = tuple(float(value) for value in mean)
+        self.std = tuple(float(value) for value in std)
+        self.crop_pct = float(crop_pct)
+        self.interpolation = str(interpolation)
+        self.crop_mode = str(crop_mode)
+
+    def process(self, image: Image.Image) -> PreprocessedSample:
+        image = image.convert("RGB")
+        _, height, width = self.input_size
+        original_width, original_height = image.size
+        mode = _interp_mode(self.interpolation)
+        if self.crop_mode == "resize":
+            resized = TF.resize(image, (height, width), interpolation=mode, antialias=True)
+            resized_size = (height, width)
+            crop_box = (0, 0, width, height)
+            canvas = resized
+        else:
+            # Match torchvision/timm evaluation semantics: resize the shorter
+            # edge while preserving aspect ratio, then take the requested crop.
+            short_edge = max(1, round(min(height, width) / self.crop_pct))
+            resized = TF.resize(image, short_edge, interpolation=mode, antialias=True)
+            if resized.height < height or resized.width < width:
+                scale = max(height / max(resized.height, 1), width / max(resized.width, 1))
+                resized = TF.resize(
+                    resized,
+                    (max(height, round(resized.height * scale)), max(width, round(resized.width * scale))),
+                    interpolation=mode, antialias=True,
+                )
+            resized_size = (resized.height, resized.width)
+            top = max(0, (resized.height - height) // 2)
+            left = max(0, (resized.width - width) // 2)
+            canvas = TF.crop(resized, top, left, height, width)
+            crop_box = (left, top, left + width, top + height)
+        geometry = PreprocessGeometry(
+            original_size=(original_width, original_height),
+            resized_size=resized_size,
+            canvas_size=(height, width), crop_box=crop_box,
+            crop_pct=self.crop_pct, crop_mode=self.crop_mode,
+            interpolation=self.interpolation,
+            normalization={"mean": self.mean, "std": self.std},
+        )
+        tensor = _normalize_rgb(canvas, self.mean, self.std)
+        return PreprocessedSample(tensor=tensor, canvas=canvas, geometry=geometry)
+
+    def process_path(self, path: str | Path) -> PreprocessedSample:
+        return self.process(open_rgb(path))
+
+    def mask_canvas(self, mask: Image.Image, geometry: PreprocessGeometry) -> Image.Image:
+        if mask.size != (geometry.original_size[0], geometry.original_size[1]):
+            raise ValueError(
+                f"mask size {mask.size} does not match image size {geometry.original_size}")
+        mode = _interp_mode(geometry.interpolation)
+        mask = mask.convert("L")
+        if geometry.crop_mode == "resize":
+            return TF.resize(mask, geometry.canvas_size, interpolation=InterpolationMode.NEAREST)
+        resized = TF.resize(mask, geometry.resized_size, interpolation=InterpolationMode.NEAREST)
+        left, top, right, bottom = geometry.crop_box
+        return resized.crop((left, top, right, bottom))
+
+    def mask_tensor(
+        self, mask: Image.Image, geometry: PreprocessGeometry,
+        output_size: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        canvas = self.mask_canvas(mask, geometry)
+        if output_size is not None:
+            canvas = TF.resize(canvas, output_size, interpolation=InterpolationMode.NEAREST)
+        values = torch.from_numpy(np.array(canvas, dtype="uint8", copy=True))
+        return values > 0
+
+
+class _TensorTransform:
+    """Pickle-safe ImageFolder transform backed by the unified preprocessor."""
+    def __init__(self, preprocessor: UnifiedPreprocessor) -> None:
+        self.preprocessor = preprocessor
+
+    def __call__(self, image: Image.Image) -> torch.Tensor:
+        return self.preprocessor.process(image).tensor
 
 
 def split_path(root: Path, split: str) -> Path:
@@ -53,12 +180,12 @@ def discover_dataset(root: Path, val_split: str, train_split: str = "train") -> 
 
 
 def build_eval_dataset(info: DatasetInfo, data_config: Dict[str, object]):
-    transform = create_transform(
-        input_size=data_config["input_size"], is_training=False,
-        mean=data_config["mean"], std=data_config["std"],
-        interpolation=data_config["interpolation"], crop_pct=data_config["crop_pct"],
-        crop_mode=data_config.get("crop_mode", "center"),
+    preprocessor = UnifiedPreprocessor(
+        tuple(data_config["input_size"]), data_config["mean"], data_config["std"],
+        float(data_config["crop_pct"]), str(data_config["interpolation"]),
+        str(data_config.get("crop_mode", "center")),
     )
+    transform = _TensorTransform(preprocessor)
     return datasets.ImageFolder(info.split_root, transform=transform)
 
 
@@ -76,7 +203,8 @@ def open_rgb(path: str | Path) -> Image.Image:
 
 def load_segmentation_mask(
     mask_root: Path, image_path: str | Path, split_root: Path,
-    output_size: Tuple[int, int],
+    output_size: Tuple[int, int], preprocessor: UnifiedPreprocessor | None = None,
+    mask_encoding: str = "auto",
 ) -> tuple[Optional[torch.Tensor], Optional[str]]:
     """Load a binary mask using an ImageFolder-relative, auditable convention."""
     image_path = Path(image_path).resolve()
@@ -90,13 +218,28 @@ def load_segmentation_mask(
         mask_root / relative.parent / f"{relative.stem}.png",
         mask_root / f"{relative.stem}.png",
     ]
-    path = next((candidate for candidate in candidates if candidate.is_file()), None)
+    existing = list(dict.fromkeys(candidate.resolve() for candidate in candidates if candidate.is_file()))
+    if len(existing) > 1:
+        raise RuntimeError(f"ambiguous segmentation mask for {image_path}: {existing}")
+    path = existing[0] if existing else None
     if path is None:
         return None, None
     with Image.open(path) as image:
-        mask = image.convert("L")
-        mask = TF.resize(mask, output_size, interpolation=InterpolationMode.NEAREST)
-        tensor = TF.to_tensor(mask)[0] > .5
+        values = set(np.unique(np.asarray(image.convert("L"), dtype="uint8")).tolist())
+        if mask_encoding not in {"auto", "01", "0255"}:
+            raise ValueError("mask_encoding must be auto, 01, or 0255")
+        if mask_encoding == "01" and not values <= {0, 1}:
+            raise ValueError(f"mask {path} is not encoded as 0/1: values={sorted(values)}")
+        if mask_encoding == "0255" and not values <= {0, 255}:
+            raise ValueError(f"mask {path} is not encoded as 0/255: values={sorted(values)}")
+        if mask_encoding == "auto" and not (values <= {0, 1} or values <= {0, 255}):
+            raise ValueError(f"mask {path} has unsupported values: {sorted(values)}")
+        if preprocessor is not None:
+            geometry = preprocessor.process_path(image_path).geometry
+            tensor = preprocessor.mask_tensor(image, geometry, output_size)
+        else:
+            tensor = TF.resize(image.convert("L"), output_size, interpolation=InterpolationMode.NEAREST)
+            tensor = torch.from_numpy(np.array(tensor, dtype="uint8", copy=True)) > 0
     return tensor, str(path.resolve())
 
 
@@ -110,10 +253,10 @@ def _interp_mode(name: str) -> InterpolationMode:
 
 
 def base_canvas(image: Image.Image, size: Tuple[int, int], crop_pct: float, interpolation: str) -> Image.Image:
-    mode = _interp_mode(interpolation)
-    resize_size = tuple(round(v / crop_pct) for v in size)
-    image = TF.resize(image, resize_size, interpolation=mode, antialias=True)
-    return TF.center_crop(image, size)
+    preprocessor = UnifiedPreprocessor(
+        (3, int(size[0]), int(size[1])), (0.485, 0.456, 0.406),
+        (0.229, 0.224, 0.225), crop_pct, interpolation)
+    return preprocessor.process(image).canvas
 
 
 def _normalize_rgb(image: Image.Image, mean: Sequence[float], std: Sequence[float]) -> torch.Tensor:
@@ -152,9 +295,11 @@ def content_scaled_tensor(
     crop_pct: float,
     interpolation: str,
     crop_position: str = "center",
+    crop_mode: str = "center",
 ) -> tuple[torch.Tensor, str]:
     _, height, width = input_size
-    canvas = base_canvas(image, (height, width), crop_pct, interpolation)
+    preprocessor = UnifiedPreprocessor(input_size, mean, std, crop_pct, interpolation, crop_mode)
+    canvas = preprocessor.process(image).canvas
     mode = _interp_mode(interpolation)
     scaled_h, scaled_w = max(1, round(height * scale)), max(1, round(width * scale))
     scaled = TF.resize(canvas, (scaled_h, scaled_w), interpolation=mode, antialias=True)
@@ -183,12 +328,13 @@ def resolution_only_tensor(
     std: Sequence[float],
     crop_pct: float,
     interpolation: str,
+    crop_mode: str = "center",
 ) -> tuple[torch.Tensor, str]:
     """Reduce effective resolution while preserving occupancy, FOV, and context."""
     if not 0 < resolution_scale <= 1:
         raise ValueError("resolution_scale must be in (0, 1]")
     _, height, width = input_size
-    canvas = base_canvas(image, (height, width), crop_pct, interpolation)
+    canvas = UnifiedPreprocessor(input_size, mean, std, crop_pct, interpolation, crop_mode).process(image).canvas
     mode = _interp_mode(interpolation)
     low_h = max(1, round(height * resolution_scale))
     low_w = max(1, round(width * resolution_scale))
@@ -206,12 +352,13 @@ def context_only_tensor(
     std: Sequence[float],
     crop_pct: float,
     interpolation: str,
+    crop_mode: str = "center",
 ) -> tuple[torch.Tensor, str]:
     """Remove peripheral context without resizing the retained center pixels."""
     if zoom_scale <= 1:
         raise ValueError("zoom_scale must be greater than one")
     _, height, width = input_size
-    canvas = base_canvas(image, (height, width), crop_pct, interpolation)
+    canvas = UnifiedPreprocessor(input_size, mean, std, crop_pct, interpolation, crop_mode).process(image).canvas
     crop_h = max(1, round(height / zoom_scale))
     crop_w = max(1, round(width / zoom_scale))
     center = _position_crop(canvas, crop_h, crop_w, "center")

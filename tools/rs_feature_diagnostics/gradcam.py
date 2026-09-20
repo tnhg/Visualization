@@ -8,10 +8,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .dataset import content_scaled_tensor, open_rgb
+from .dataset import UnifiedPreprocessor, content_scaled_tensor, open_rgb
 from .sample_selector import Prediction, extract_logits
 from .tensor_adapter import FeatureTensorAdapter, first_tensor
-from .utils import safe_name
+from .utils import artifact_path, safe_name
 from .visualization import heatmap, multi_panel, overlay
 
 
@@ -35,7 +35,7 @@ class GradCAM:
         self.adapter = FeatureTensorAdapter()
 
     def _hook(self, _module, _inputs, output):
-        tensor = first_tensor(output)
+        tensor = first_tensor(output, strict=True)
         if tensor is None:
             raise TypeError(f"Grad-CAM layer {self.layer_name} output contains no tensor")
         self.activation = tensor
@@ -84,14 +84,19 @@ def analyze_gradcam_samples(
     std: Optional[Sequence[float]] = None,
     crop_pct: float = 1.0,
     interpolation: str = "bilinear",
+    crop_mode: str = "center",
 ) -> list[dict]:
     rows = []
     model.eval()
+    preprocessor = UnifiedPreprocessor(
+        input_size, mean or (0.485, 0.456, 0.406), std or (0.229, 0.224, 0.225),
+        crop_pct, interpolation, crop_mode) if input_size else None
     with GradCAM(model, layer_name, layout_hint) as gradcam:
         for sample_no, prediction in enumerate(predictions):
-            tensor, _ = dataset[prediction.dataset_index]
+            processed = preprocessor.process_path(prediction.image_path) if preprocessor else None
+            tensor = (processed.tensor if processed is not None else dataset[prediction.dataset_index][0])
             tensor = tensor.unsqueeze(0).to(device)
-            original = open_rgb(prediction.image_path)
+            original = processed.canvas if processed is not None else open_rgb(prediction.image_path)
             if target_mode == "predicted":
                 targets = [("pred", prediction.pred_index)]
             elif target_mode == "true":
@@ -102,11 +107,11 @@ def analyze_gradcam_samples(
                 targets = [("index", class_index)]
             else:
                 targets = [("pred", prediction.pred_index), ("true", prediction.true_index)]
-            sample_id = f"{sample_no:04d}_{safe_name(prediction.true_class)}_to_{safe_name(prediction.pred_class)}"
+            sample_id = prediction.sample_id
             for target_name, target in targets:
                 result = gradcam.compute(tensor, target)
                 base = output_dir / "gradcam" / f"{sample_id}_{target_name}"
-                np.save(base.with_suffix(".npy"), result.cam)
+                np.save(artifact_path(base, ".npy"), result.cam)
                 heatmap(result.cam, base.with_name(base.name + "_map"), f"Grad-CAM ({target_name} class)")
                 overlay(original, result.cam, base.with_name(base.name + "_overlay"), f"Grad-CAM ({target_name} class)")
                 rows.append({"sample_id": sample_id, "image_path": prediction.image_path, "target": target_name,
@@ -122,11 +127,12 @@ def analyze_gradcam_samples(
                     scale_titles = []
                     for scale in scales:
                         scaled, method = content_scaled_tensor(
-                            original, scale, input_size, mean, std, crop_pct, interpolation)
+                            original, scale, input_size, mean, std, crop_pct, interpolation,
+                            "center", crop_mode)
                         result = gradcam.compute(scaled.unsqueeze(0).to(device), target)
                         suffix = str(scale).replace(".", "p")
                         base = output_dir / "gradcam" / f"{sample_id}_scale_{suffix}_{target_name}"
-                        np.save(base.with_suffix(".npy"), result.cam)
+                        np.save(artifact_path(base, ".npy"), result.cam)
                         heatmap(result.cam, base.with_name(base.name + "_map"),
                                 f"Grad-CAM ({target_name}), scale={scale:g}")
                         scale_cams.append(result.cam)

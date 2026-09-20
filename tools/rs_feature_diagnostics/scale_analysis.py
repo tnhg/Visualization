@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Callable, Dict, Optional, Sequence
 
@@ -48,6 +49,9 @@ class _Evaluation:
     gt_margin: torch.Tensor
     correct: torch.Tensor
     method: str
+    input_fingerprints: list[str]
+    sample_ids: list[str]
+    targets: list[int]
 
 
 def _scale_name(scale: float) -> str:
@@ -74,6 +78,7 @@ def _evaluate_intervention(
 ) -> _Evaluation:
     all_logits: list[torch.Tensor] = []
     methods: set[str] = set()
+    input_fingerprints: list[str] = []
     model.eval()
     with torch.inference_mode():
         for start in range(0, len(predictions), batch_size):
@@ -82,6 +87,7 @@ def _evaluate_intervention(
             for prediction in chunk:
                 tensor, method = intervention.transform(open_rgb(prediction.image_path))
                 tensors.append(tensor)
+                input_fingerprints.append(hashlib.sha1(tensor.float().numpy().tobytes()).hexdigest())
                 methods.add(method)
             batch = torch.stack(tensors).to(device, non_blocking=True)
             with autocast_context(device, amp):
@@ -106,6 +112,9 @@ def _evaluate_intervention(
         gt_margin=gt_margin,
         correct=predicted.eq(targets),
         method=";".join(sorted(methods)),
+        input_fingerprints=input_fingerprints,
+        sample_ids=[item.sample_id for item in predictions],
+        targets=[item.true_index for item in predictions],
     )
 
 
@@ -164,6 +173,8 @@ def _write_prediction_rows(
                 "scale": evaluation.intervention.scale,
                 "crop_position": evaluation.intervention.crop_position,
                 "dataset_index": prediction.dataset_index,
+                "sample_id": prediction.sample_id,
+                "relative_path": prediction.relative_path,
                 "image_path": prediction.image_path,
                 "true_class": prediction.true_class,
                 "true_index": prediction.true_index,
@@ -342,21 +353,22 @@ def _run_intervention_analysis(
     scales: Sequence[float],
     batch_size: int,
     amp: bool,
+    crop_mode: str = "center",
 ) -> None:
     if not any(abs(scale - 1.) < 1e-8 for scale in scales):
         raise ValueError("content-scale intervention requires scale=1 as its baseline")
 
     def content_transform(scale: float, position: str = "center"):
         return lambda image: content_scaled_tensor(
-            image, scale, input_size, mean, std, crop_pct, interpolation, position)
+            image, scale, input_size, mean, std, crop_pct, interpolation, position, crop_mode)
 
     def resolution_transform(scale: float):
         return lambda image: resolution_only_tensor(
-            image, scale, input_size, mean, std, crop_pct, interpolation)
+            image, scale, input_size, mean, std, crop_pct, interpolation, crop_mode)
 
     def context_transform(scale: float):
         return lambda image: context_only_tensor(
-            image, scale, input_size, mean, std, crop_pct, interpolation)
+            image, scale, input_size, mean, std, crop_pct, interpolation, crop_mode)
 
     main_interventions = [
         _Intervention(
@@ -403,11 +415,44 @@ def _run_intervention_analysis(
 
     original_predictions = torch.tensor([item.pred_index for item in predictions])
     original_mismatch = int(baseline.predicted.ne(original_predictions).sum())
+    expected_sample_ids = [item.sample_id for item in predictions]
+    sample_id_mismatch = sum(
+        current != expected
+        for current, expected in zip(baseline.sample_ids, expected_sample_ids)
+    )
+    expected_targets = [item.true_index for item in predictions]
+    target_mismatch = sum(
+        int(current) != int(expected)
+        for current, expected in zip(baseline.targets, expected_targets)
+    )
+    expected_logits = [item.logits for item in predictions]
+    logit_deltas = [
+        float(torch.tensor(current).sub(torch.tensor(expected)).abs().max())
+        for current, expected in zip(baseline.logits.tolist(), expected_logits)
+        if expected
+    ]
+    input_mismatch = sum(
+        bool(expected and expected != current)
+        for current, expected in zip(baseline.input_fingerprints, [item.input_fingerprint for item in predictions])
+    )
+    identity_pass = (
+        original_mismatch == 0 and sample_id_mismatch == 0 and target_mismatch == 0
+        and input_mismatch == 0 and all(delta <= 1e-5 for delta in logit_deltas)
+    )
     write_csv(output_dir / "tables" / "scale_identity_audit.csv", [{
         "samples": len(predictions),
         "prediction_mismatch_vs_initial_inference": original_mismatch,
-        "pass": original_mismatch == 0,
+        "sample_id_mismatch": sample_id_mismatch,
+        "target_mismatch": target_mismatch,
+        "input_tensor_mismatch": input_mismatch,
+        "max_abs_logit_delta": max(logit_deltas) if logit_deltas else None,
+        "numeric_mode": "amp" if amp else "float32",
+        "pass": identity_pass,
+        "status": "complete" if identity_pass else "blocked",
+        "reason": "" if identity_pass else "scale=1 is not identical to the population inference baseline",
     }])
+    if not identity_pass:
+        raise RuntimeError("scale identity audit failed; refusing to compare intervention conditions")
 
     originally_wrong = ~baseline.correct
     correction_curve = [
@@ -463,6 +508,7 @@ def analyze_scale(
     batch_size: int,
     amp: bool,
     layouts: Optional[Dict[str, str]] = None,
+    crop_mode: str = "center",
 ) -> ScaleAnalysisResult:
     layouts = layouts or {}
     adapter = FeatureTensorAdapter()
@@ -477,7 +523,7 @@ def analyze_scale(
         image = open_rgb(prediction.image_path)
         for scale_index, scale in enumerate(scales):
             tensor, method = content_scaled_tensor(
-                image, scale, input_size, mean, std, crop_pct, interpolation)
+                image, scale, input_size, mean, std, crop_pct, interpolation, "center", crop_mode)
             batch = tensor.unsqueeze(0).to(device)
             with CaptureHookManager(model, stage_names, detach=True) as hooks:
                 with torch.inference_mode():
@@ -501,7 +547,7 @@ def analyze_scale(
                 response_count[stage][scale_index] += 1
                 concentration = float(maps["energy"].amax() / (maps["energy"].sum() + 1e-12))
                 rows.append({
-                    "sample_id": sample_no,
+                    "sample_id": prediction.sample_id,
                     "dataset_index": prediction.dataset_index,
                     "image_path": prediction.image_path,
                     "true_class": prediction.true_class,
@@ -520,7 +566,7 @@ def analyze_scale(
 
     _run_intervention_analysis(
         model, population_predictions, classes, device, output_dir,
-        input_size, mean, std, crop_pct, interpolation, scales, batch_size, amp)
+        input_size, mean, std, crop_pct, interpolation, scales, batch_size, amp, crop_mode)
 
     responses: Dict[str, np.ndarray] = {}
     preference_rows: list[dict] = []

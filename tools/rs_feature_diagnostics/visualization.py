@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 
+from .utils import artifact_path
+
 
 def normalize_map(array: np.ndarray) -> np.ndarray:
     array = np.nan_to_num(array.astype(np.float32))
@@ -20,8 +22,8 @@ def save_figure(fig, base_path: Path) -> None:
     base_path.parent.mkdir(parents=True, exist_ok=True)
     fig.patch.set_facecolor("white")
     fig.tight_layout()
-    fig.savefig(base_path.with_suffix(".png"), dpi=300, bbox_inches="tight", facecolor="white")
-    fig.savefig(base_path.with_suffix(".pdf"), bbox_inches="tight", facecolor="white")
+    fig.savefig(artifact_path(base_path, ".png"), dpi=300, bbox_inches="tight", facecolor="white")
+    fig.savefig(artifact_path(base_path, ".pdf"), bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -126,6 +128,8 @@ def multi_panel(
     arrays: Sequence[np.ndarray], titles: Sequence[str], base_path: Path,
     cmaps: Optional[Sequence[str]] = None, columns: int = 3,
 ) -> None:
+    if not arrays:
+        return
     rows = int(np.ceil(len(arrays) / columns))
     fig, axes = plt.subplots(rows, columns, figsize=(4.2 * columns, 3.7 * rows), squeeze=False)
     cmaps = cmaps or ["viridis"] * len(arrays)

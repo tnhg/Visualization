@@ -115,3 +115,24 @@ the texture proxy is not relabeled as ground truth.
 - Dataset-wide interventions and all-channel ERF are intentionally expensive.
 - `--channel-keep-ratios 0` means retain one representative per similarity cluster;
   the CSV also records the resulting effective retained ratio.
+
+## Schema v2 workflow
+
+For the auditable offline workflow, copy `configs/rsdiag_aid_d4.yaml` or run:
+
+```bash
+python -m tools.rs_feature_diagnostics init --output configs/my_run.yaml
+python -m tools.rs_feature_diagnostics doctor --config configs/my_run.yaml
+python -m tools.rs_feature_diagnostics run --config configs/my_run.yaml
+```
+
+Open the generated `index.html`. `render` and `summarize` operate on an existing run
+without loading a checkpoint. `compare` joins complete populations by stable
+`sample_id` and refuses mismatched class/path mappings. See `docs/QUICKSTART_ZH.md`,
+`docs/METRICS_AND_LIMITS_ZH.md`, and `docs/MIGRATION.md` for the evidence contract and
+legacy CLI compatibility.
+
+Each completed run keeps three explicit scopes: the full population in
+`predictions/predictions.csv`, the bounded diagnostic cohort in
+`predictions/diagnostic_samples.csv`, and the small display cohort in
+`predictions/display_samples.csv` (`selected_samples.csv` remains a compatibility alias).
